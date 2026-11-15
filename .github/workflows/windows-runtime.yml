@@ -63,6 +63,9 @@ jobs:
             if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $entry.hash) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
             Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $candidate 'runtime')
           }
+          # Download credentials are unnecessary in the tested processes.
+          $env:GH_TOKEN = $null
+          $env:GITHUB_TOKEN = $null
           $expanded = Join-Path $candidate 'runtime'
           $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo-player.exe')
           $harnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'managed-player-smoke.mjs')
