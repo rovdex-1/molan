@@ -70,6 +70,7 @@ jobs:
               while (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
               if (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT)) { throw 'PLAYER_REPORT_TIMEOUT' }
               $report = Get-Content -LiteralPath $env:MIPO_PLAYER_REPORT -Raw | ConvertFrom-Json
+              Write-Host ('FIXTURE_REPORT: ' + ($report | ConvertTo-Json -Depth 8 -Compress))
               if ($report.supported -ne $true -or $report.isolated -ne $true) { throw ('PLAYER_EME_FAILED: ' + ($report | ConvertTo-Json -Depth 8 -Compress)) }
               if ($report.electron -ne '45.2.1' -or $report.chromium -ne '156.0.8078.75') { throw 'PLAYER_RUNTIME_VERSION_MISMATCH' }
               if ($report.userAgent -notlike ('*Chrome/' + $report.chromium + '*') -or $report.userAgent -like '*Electron/*') { throw 'PLAYER_USER_AGENT_MISMATCH' }
@@ -80,11 +81,11 @@ jobs:
                 $deadline = [DateTime]::UtcNow.AddSeconds(15)
                 while ((Test-Path -LiteralPath $report.temporaryDataDirectory) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
                 if (Test-Path -LiteralPath $report.temporaryDataDirectory) {
-                  Get-ChildItem -LiteralPath $report.temporaryDataDirectory | Select-Object Name,Mode
-                  Get-CimInstance Win32_Process | Where-Object ParentProcessId -eq $report.pid | Select-Object ProcessId,ParentProcessId,Name
-                  try { Remove-Item -LiteralPath $report.temporaryDataDirectory -Recurse -Force -ErrorAction Stop; Write-Output 'DIAGNOSTIC_MANUAL_REMOVAL_SUCCEEDED' } catch { Write-Output ('DIAGNOSTIC_REMOVAL_FAILED: ' + $_.Exception.Message) }
+                  Write-Host ('PRIVATE_FILES: ' + ((Get-ChildItem -LiteralPath $report.temporaryDataDirectory | Select-Object Name,Mode) | ConvertTo-Json -Compress))
+                  Write-Host ('CHILD_PROCESSES: ' + ((Get-CimInstance Win32_Process | Where-Object ParentProcessId -eq $report.pid | Select-Object ProcessId,ParentProcessId,Name) | ConvertTo-Json -Compress))
+                  try { Remove-Item -LiteralPath $report.temporaryDataDirectory -Recurse -Force -ErrorAction Stop; Write-Host 'DIAGNOSTIC_MANUAL_REMOVAL_SUCCEEDED' } catch { Write-Host ('DIAGNOSTIC_REMOVAL_FAILED: ' + $_.Exception.Message) }
                   $trace = $env:MIPO_PLAYER_REPORT + '.trace'
-                  if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace }
+                  if (Test-Path -LiteralPath $trace) { Write-Host (Get-Content -LiteralPath $trace -Raw) }
                   throw 'PLAYER_PRIVATE_DATA_NOT_REMOVED'
                 }
               }
