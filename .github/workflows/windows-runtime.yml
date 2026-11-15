@@ -202,6 +202,9 @@ jobs:
           Assert-X64Executable $executables[0].FullName
           Assert-X64Executable (Join-Path $portableRoot 'resources/mipo-core.exe')
           $env:MIPO_SMOKE_SLOW = '1'
+          # Visual-state assertions need an active rendering timeline.
+          # The application keeps smoke windows hidden unless requested.
+          $env:MIPO_SMOKE_SHOW_WINDOW = '1'
           $env:MIPO_SMOKE_EXECUTABLE = $executables[0].FullName
           $log = Join-Path $candidate 'portable-smoke.log'
           & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
