@@ -3,19 +3,27 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Draft release containing the candidate ZIP (empty checks runner availability)
+        description: Draft release containing candidates (empty checks runner availability)
         required: false
         type: string
       asset_name:
-        description: Candidate ZIP asset name
+        description: Candidate player ZIP asset name
         required: false
         type: string
       sha256:
-        description: Expected SHA-256
+        description: Expected player SHA-256
+        required: false
+        type: string
+      harness_asset:
+        description: Compiled validation harness ZIP asset name
+        required: false
+        type: string
+      harness_sha256:
+        description: Expected harness SHA-256
         required: false
         type: string
 permissions:
-  # Draft releases are visible only to a token with repository push permission.
+  # GitHub exposes draft assets only to tokens with repository push permission.
   contents: write
 jobs:
   validate:
@@ -27,9 +35,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           [Environment]::OSVersion.VersionString
+          node --version
           if (-not [Environment]::Is64BitOperatingSystem) { throw 'WINDOWS_X64_REQUIRED' }
           Write-Output 'WINDOWS_RUNNER_READY'
-      - name: Verify packaged player
+      - name: Verify packaged player with Main lifecycle
         if: inputs.release_tag != ''
         shell: pwsh
         env:
@@ -37,77 +46,53 @@ jobs:
           RELEASE_TAG: ${{ inputs.release_tag }}
           ASSET_NAME: ${{ inputs.asset_name }}
           EXPECTED_SHA256: ${{ inputs.sha256 }}
+          HARNESS_ASSET: ${{ inputs.harness_asset }}
+          HARNESS_SHA256: ${{ inputs.harness_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9._-]+$') { throw 'INVALID_RELEASE_TAG' }
           if ($env:ASSET_NAME -notmatch '^MIPO-Player-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
-          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
+          if ($env:HARNESS_ASSET -notmatch '^MIPO-Player-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_HARNESS_NAME' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$' -or $env:HARNESS_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
           $candidate = Join-Path $env:RUNNER_TEMP 'mipo-candidate'
           New-Item -ItemType Directory -Path $candidate | Out-Null
-          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --dir $candidate
-          if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
-          $archive = Join-Path $candidate $env:ASSET_NAME
-          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
-          $expanded = Join-Path $candidate 'runtime'
-          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
-          $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo-player.exe')
-          if ($executables.Count -ne 1) { throw 'PLAYER_EXECUTABLE_COUNT' }
-          $fixtures = @(
-            @{ profile = 'profile_a'; private = $false; previous = $null },
-            @{ profile = 'profile_a'; private = $false; previous = 'profile_a' },
-            @{ profile = 'profile_b'; private = $false; previous = $null },
-            @{ profile = 'profile_a'; private = $true; previous = $null }
-          )
-          $data = Join-Path $candidate 'data'
-          $reports = @()
-          foreach ($fixture in $fixtures) {
-            $env:MIPO_PLAYER_REPORT = Join-Path $candidate ('report-' + $reports.Count + '.json')
-            $arguments = @('--smoke', "--data-root=$data", ('--profile-id=' + $fixture.profile))
-            if ($fixture.private) { $arguments += '--private-session=fixture_private' }
-            $process = Start-Process -FilePath $executables[0].FullName -ArgumentList $arguments -PassThru
-            try {
-              $deadline = [DateTime]::UtcNow.AddSeconds(180)
-              while (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
-              if (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT)) { throw 'PLAYER_REPORT_TIMEOUT' }
-              $report = Get-Content -LiteralPath $env:MIPO_PLAYER_REPORT -Raw | ConvertFrom-Json
-              Write-Host ('FIXTURE_REPORT: ' + ($report | ConvertTo-Json -Depth 8 -Compress))
-              if ($report.supported -ne $true -or $report.isolated -ne $true) { throw ('PLAYER_EME_FAILED: ' + ($report | ConvertTo-Json -Depth 8 -Compress)) }
-              if ($report.electron -ne '45.2.1' -or $report.chromium -ne '156.0.8078.75') { throw 'PLAYER_RUNTIME_VERSION_MISMATCH' }
-              if ($report.userAgent -notlike ('*Chrome/' + $report.chromium + '*') -or $report.userAgent -like '*Electron/*') { throw 'PLAYER_USER_AGENT_MISMATCH' }
-              if ($report.previousScope -ne $fixture.previous -or $report.private -ne $fixture.private) { throw 'PLAYER_PROFILE_ISOLATION_FAILED' }
-              if (-not $process.WaitForExit(10000)) { throw 'PLAYER_DID_NOT_EXIT' }
-              if ($process.ExitCode -ne 0) { throw 'PLAYER_EXIT_FAILED' }
-              if ($fixture.private) {
-                $deadline = [DateTime]::UtcNow.AddSeconds(15)
-                while ((Test-Path -LiteralPath $report.temporaryDataDirectory) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
-                if (Test-Path -LiteralPath $report.temporaryDataDirectory) {
-                  Write-Host ('PRIVATE_FILES: ' + ((Get-ChildItem -LiteralPath $report.temporaryDataDirectory | Select-Object Name,Mode) | ConvertTo-Json -Compress))
-                  Write-Host ('CHILD_PROCESSES: ' + ((Get-CimInstance Win32_Process | Where-Object ParentProcessId -eq $report.pid | Select-Object ProcessId,ParentProcessId,Name) | ConvertTo-Json -Compress))
-                  Write-Host ('PLAYER_PID: launched=' + $process.Id + ' reported=' + $report.pid)
-                  Write-Host ('REPORTED_PROCESS: ' + ((Get-Process -Id $report.pid -ErrorAction SilentlyContinue | Select-Object Id,ProcessName) | ConvertTo-Json -Compress))
-                  $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($report.temporaryDataDirectory))
-                  $cleanupScript = '$ErrorActionPreference=''Stop''; Wait-Process -Id {0} -ErrorAction SilentlyContinue; if(Get-Process -Id {0} -ErrorAction SilentlyContinue){{exit 2}}; $privateDirectory=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''{1}'')); Remove-Item -LiteralPath $privateDirectory -Recurse -Force -ErrorAction SilentlyContinue' -f $report.pid,$encodedPath
-                  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanupScript))
-                  $stdout = Join-Path $candidate 'cleanup-direct.stdout'
-                  $stderr = Join-Path $candidate 'cleanup-direct.stderr'
-                  $direct = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$encodedCommand) -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-                  if (-not $direct.WaitForExit(10000)) { Stop-Process -Id $direct.Id -Force; Write-Host 'DIRECT_CLEANUP_TIMEOUT' }
-                  Write-Host ('DIRECT_CLEANUP_EXIT: ' + $direct.ExitCode)
-                  Write-Host ('DIRECT_CLEANUP_STDOUT: ' + (Get-Content -LiteralPath $stdout -Raw))
-                  Write-Host ('DIRECT_CLEANUP_STDERR: ' + (Get-Content -LiteralPath $stderr -Raw))
-                  Write-Host ('DIRECT_CLEANUP_REMOVED: ' + (-not (Test-Path -LiteralPath $report.temporaryDataDirectory)))
-                  try { Remove-Item -LiteralPath $report.temporaryDataDirectory -Recurse -Force -ErrorAction Stop; Write-Host 'DIAGNOSTIC_MANUAL_REMOVAL_SUCCEEDED' } catch { Write-Host ('DIAGNOSTIC_REMOVAL_FAILED: ' + $_.Exception.Message) }
-                  $trace = $env:MIPO_PLAYER_REPORT + '.trace'
-                  if (Test-Path -LiteralPath $trace) { Write-Host (Get-Content -LiteralPath $trace -Raw) }
-                  throw 'PLAYER_PRIVATE_DATA_NOT_REMOVED'
-                }
-              }
-              $report.PSObject.Properties.Remove('temporaryDataDirectory')
-              $report.PSObject.Properties.Remove('pid')
-              $reports += $report
-            } finally {
-              if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
-            }
+          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256})) {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $entry.name --dir $candidate
+            if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
+            $archive = Join-Path $candidate $entry.name
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $entry.hash) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
+            Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $candidate 'runtime')
           }
-          @{ passed = $true; fixtures = $reports.Count; reports = $reports } | ConvertTo-Json -Depth 10 -Compress
-          Write-Output 'WINDOWS_PLAYER_SMOKE_PASSED'
+          $expanded = Join-Path $candidate 'runtime'
+          $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo-player.exe')
+          $harnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'managed-player-smoke.mjs')
+          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1) { throw 'RUNTIME_ENTRY_COUNT' }
+          $env:MIPO_PLAYER_EXECUTABLE = $executables[0].FullName
+          $env:MIPO_PLAYER_SMOKE_REPORT = Join-Path $candidate 'managed-report.json'
+          # This compiled harness uses the application's actual Main launcher.
+          # No private source checkout or account/EVS credentials are needed here.
+          & node $harnesses[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'MAIN_PLAYER_SMOKE_FAILED' }
+          $reports = Get-Content -LiteralPath $env:MIPO_PLAYER_SMOKE_REPORT -Raw | ConvertFrom-Json
+          if ($reports.Count -ne 4 -or $reports[3].private -ne $true) { throw 'PLAYER_FIXTURE_COUNT' }
+          foreach ($report in $reports) {
+            if ($report.supported -ne $true -or $report.isolated -ne $true) { throw 'PLAYER_EME_FAILED' }
+            if ($report.electron -ne '45.2.1' -or $report.chromium -ne '156.0.8078.75') { throw 'PLAYER_RUNTIME_VERSION_MISMATCH' }
+          }
+          # An internal private launch must fail before making a temp profile
+          # when its Main lifecycle owner is absent.
+          $temporaryRoot = [IO.Path]::GetTempPath()
+          $before = @(Get-ChildItem -LiteralPath $temporaryRoot -Directory -Filter 'mipo-player-private-*' | ForEach-Object FullName)
+          $env:MIPO_PLAYER_MANAGED = $null
+          $env:MIPO_PLAYER_REPORT = Join-Path $candidate 'unmanaged-report.json'
+          $unmanaged = Start-Process -FilePath $env:MIPO_PLAYER_EXECUTABLE -ArgumentList @('--smoke','--private-session=unmanaged_fixture') -PassThru
+          try {
+            if (-not $unmanaged.WaitForExit(10000)) { throw 'UNMANAGED_PRIVATE_DID_NOT_EXIT' }
+            $denied = Get-Content -LiteralPath $env:MIPO_PLAYER_REPORT -Raw | ConvertFrom-Json
+            if ($unmanaged.ExitCode -eq 0 -or $denied.error -ne 'PLAYER_PRIVATE_REQUIRES_MAIN') { throw 'UNMANAGED_PRIVATE_NOT_DENIED' }
+            $added = @(Get-ChildItem -LiteralPath $temporaryRoot -Directory -Filter 'mipo-player-private-*' | ForEach-Object FullName | Where-Object { $before -notcontains $_ })
+            if ($added.Count -ne 0) { throw 'UNMANAGED_PRIVATE_CREATED_DATA' }
+          } finally {
+            if (-not $unmanaged.HasExited) { Stop-Process -Id $unmanaged.Id -Force }
+          }
+          Write-Output 'WINDOWS_MAIN_PLAYER_SMOKE_PASSED'
