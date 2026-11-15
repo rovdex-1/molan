@@ -1,0 +1,91 @@
+name: Validate Windows runtime
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Draft release containing the candidate ZIP (empty checks runner availability)
+        required: false
+        type: string
+      asset_name:
+        description: Candidate ZIP asset name
+        required: false
+        type: string
+      sha256:
+        description: Expected SHA-256
+        required: false
+        type: string
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check Windows runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Environment]::OSVersion.VersionString
+          if (-not [Environment]::Is64BitOperatingSystem) { throw 'WINDOWS_X64_REQUIRED' }
+          Write-Output 'WINDOWS_RUNNER_READY'
+      - name: Verify packaged player
+        if: inputs.release_tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9._-]+$') { throw 'INVALID_RELEASE_TAG' }
+          if ($env:ASSET_NAME -notmatch '^MIPO-Player-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
+          $candidate = Join-Path $env:RUNNER_TEMP 'mipo-candidate'
+          New-Item -ItemType Directory -Path $candidate | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET_NAME --dir $candidate
+          if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
+          $archive = Join-Path $candidate $env:ASSET_NAME
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $env:EXPECTED_SHA256) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
+          $expanded = Join-Path $candidate 'runtime'
+          Expand-Archive -LiteralPath $archive -DestinationPath $expanded
+          $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo-player.exe')
+          if ($executables.Count -ne 1) { throw 'PLAYER_EXECUTABLE_COUNT' }
+          $fixtures = @(
+            @{ profile = 'profile_a'; private = $false; previous = $null },
+            @{ profile = 'profile_a'; private = $false; previous = 'profile_a' },
+            @{ profile = 'profile_b'; private = $false; previous = $null },
+            @{ profile = 'profile_a'; private = $true; previous = $null }
+          )
+          $data = Join-Path $candidate 'data'
+          $reports = @()
+          foreach ($fixture in $fixtures) {
+            $env:MIPO_PLAYER_REPORT = Join-Path $candidate ('report-' + $reports.Count + '.json')
+            $arguments = @('--smoke', "--data-root=$data", ('--profile-id=' + $fixture.profile))
+            if ($fixture.private) { $arguments += '--private-session=fixture_private' }
+            $process = Start-Process -FilePath $executables[0].FullName -ArgumentList $arguments -PassThru
+            try {
+              $deadline = [DateTime]::UtcNow.AddSeconds(180)
+              while (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
+              if (-not (Test-Path -LiteralPath $env:MIPO_PLAYER_REPORT)) { throw 'PLAYER_REPORT_TIMEOUT' }
+              $report = Get-Content -LiteralPath $env:MIPO_PLAYER_REPORT -Raw | ConvertFrom-Json
+              if ($report.supported -ne $true -or $report.isolated -ne $true) { throw ('PLAYER_EME_FAILED: ' + ($report | ConvertTo-Json -Depth 8 -Compress)) }
+              if ($report.electron -ne '45.2.1' -or $report.chromium -ne '156.0.8078.75') { throw 'PLAYER_RUNTIME_VERSION_MISMATCH' }
+              if ($report.userAgent -notlike ('*Chrome/' + $report.chromium + '*') -or $report.userAgent -like '*Electron/*') { throw 'PLAYER_USER_AGENT_MISMATCH' }
+              if ($report.previousScope -ne $fixture.previous -or $report.private -ne $fixture.private) { throw 'PLAYER_PROFILE_ISOLATION_FAILED' }
+              if (-not $process.WaitForExit(10000)) { throw 'PLAYER_DID_NOT_EXIT' }
+              if ($process.ExitCode -ne 0) { throw 'PLAYER_EXIT_FAILED' }
+              if ($fixture.private) {
+                $deadline = [DateTime]::UtcNow.AddSeconds(15)
+                while ((Test-Path -LiteralPath $report.temporaryDataDirectory) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
+                if (Test-Path -LiteralPath $report.temporaryDataDirectory) { throw 'PLAYER_PRIVATE_DATA_NOT_REMOVED' }
+              }
+              $report.PSObject.Properties.Remove('temporaryDataDirectory')
+              $report.PSObject.Properties.Remove('pid')
+              $reports += $report
+            } finally {
+              if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
+            }
+          }
+          @{ passed = $true; fixtures = $reports.Count; reports = $reports } | ConvertTo-Json -Depth 10 -Compress
+          Write-Output 'WINDOWS_PLAYER_SMOKE_PASSED'
