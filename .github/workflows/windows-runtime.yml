@@ -2,6 +2,12 @@ name: Validate Windows runtime
 on:
   workflow_dispatch:
     inputs:
+      kind:
+        description: Runtime acceptance target
+        type: choice
+        default: player
+        options: [player, native]
+        required: false
       release_tag:
         description: Draft release containing candidates (empty checks runner availability)
         required: false
@@ -39,7 +45,7 @@ jobs:
           if (-not [Environment]::Is64BitOperatingSystem) { throw 'WINDOWS_X64_REQUIRED' }
           Write-Output 'WINDOWS_RUNNER_READY'
       - name: Verify packaged player with Main lifecycle
-        if: inputs.release_tag != ''
+        if: inputs.release_tag != '' && inputs.kind != 'native'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,3 +105,40 @@ jobs:
             if (-not $unmanaged.HasExited) { Stop-Process -Id $unmanaged.Id -Force }
           }
           Write-Output 'WINDOWS_MAIN_PLAYER_SMOKE_PASSED'
+      - name: Verify native visited-link pixels
+        if: inputs.release_tag != '' && inputs.kind == 'native'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+          HARNESS_ASSET: ${{ inputs.harness_asset }}
+          HARNESS_SHA256: ${{ inputs.harness_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9._-]+$') { throw 'INVALID_RELEASE_TAG' }
+          if ($env:ASSET_NAME -notmatch '^MIPO-Native-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
+          if ($env:HARNESS_ASSET -notmatch '^MIPO-Native-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_HARNESS_NAME' }
+          if ($env:EXPECTED_SHA256 -notmatch '^[0-9a-f]{64}$' -or $env:HARNESS_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
+          $candidate = Join-Path $env:RUNNER_TEMP 'mipo-native'
+          New-Item -ItemType Directory -Path $candidate | Out-Null
+          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256})) {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $entry.name --dir $candidate
+            if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
+            $archive = Join-Path $candidate $entry.name
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $entry.hash) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
+            Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $candidate 'runtime')
+          }
+          $env:GH_TOKEN = $null
+          $env:GITHUB_TOKEN = $null
+          $executables = @(Get-ChildItem -LiteralPath (Join-Path $candidate 'runtime') -Recurse -Filter 'electron.exe')
+          $harnesses = @(Get-ChildItem -LiteralPath (Join-Path $candidate 'runtime') -Recurse -Filter 'visited-link-runtime-probe.mjs')
+          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1) { throw 'RUNTIME_ENTRY_COUNT' }
+          $receipt = Get-Content -LiteralPath (Join-Path $harnesses[0].Directory.Parent.FullName 'receipt.json') -Raw | ConvertFrom-Json
+          if ($receipt.sourceSha256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_PROBE_RECEIPT' }
+          $env:MIPO_VISITED_PROBE_EXECUTABLE = $executables[0].FullName
+          $env:MIPO_VISITED_PROBE_ARCH = 'x64'
+          & node $harnesses[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_VISITED_LINK_PROBE_FAILED' }
+          Write-Output ('MIPO_NATIVE_VISITED_PROBE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $receipt.sourceSha256)
