@@ -1,0 +1,69 @@
+name: Validate Intel macOS package
+run-name: Intel package ${{ inputs.asset_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Unpublished validation release
+        required: true
+        type: string
+      asset_name:
+        description: Checksummed application ZIP
+        required: true
+        type: string
+      sha256:
+        description: Application SHA-256
+        required: true
+        type: string
+      harness_asset:
+        description: Compiled smoke harness ZIP
+        required: true
+        type: string
+      harness_sha256:
+        description: Harness SHA-256
+        required: true
+        type: string
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: macos-15-intel
+    timeout-minutes: 15
+    steps:
+      - name: Validate exact package on Intel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+          HARNESS_ASSET: ${{ inputs.harness_asset }}
+          HARNESS_SHA256: ${{ inputs.harness_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" = x86_64 ]]
+          [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]
+          [[ "$ASSET_NAME" =~ ^MIPO-Desktop-[A-Za-z0-9._-]+-macos-x64.zip$ ]]
+          [[ "$HARNESS_ASSET" =~ ^MIPO-Desktop-Smoke-[a-f0-9]{12}.zip$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$HARNESS_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          sw_vers
+          node --version
+          candidate="$RUNNER_TEMP/mipo-candidate"
+          mkdir -p "$candidate/runtime"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET_NAME" --dir "$candidate"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$HARNESS_ASSET" --dir "$candidate"
+          [[ "$(shasum -a 256 "$candidate/$ASSET_NAME" | cut -d ' ' -f1)" = "$EXPECTED_SHA256" ]]
+          [[ "$(shasum -a 256 "$candidate/$HARNESS_ASSET" | cut -d ' ' -f1)" = "$HARNESS_SHA256" ]]
+          ditto -x -k "$candidate/$ASSET_NAME" "$candidate/runtime"
+          ditto -x -k "$candidate/$HARNESS_ASSET" "$candidate/runtime"
+          unset GH_TOKEN GITHUB_TOKEN
+          bundle="$candidate/runtime/MIPO.app"
+          codesign --verify --deep --strict "$bundle"
+          lipo -verify_arch x86_64 "$bundle/Contents/MacOS/mipo"
+          lipo -verify_arch x86_64 "$bundle/Contents/Resources/mipo-core"
+          export MIPO_SMOKE_EXECUTABLE="$bundle/Contents/MacOS/mipo"
+          export MIPO_SMOKE_SLOW=1
+          node "$candidate/runtime/desktop-harness/packaged-smoke.mjs" 2>&1 | tee "$candidate/smoke.log"
+          [[ "$(grep -c 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED' "$candidate/smoke.log")" = 2 ]]
+          echo "MIPO_INTEL_PACKAGED_SMOKE_PASSED $EXPECTED_SHA256 $HARNESS_SHA256"
