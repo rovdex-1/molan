@@ -64,6 +64,6 @@ jobs:
           lipo -verify_arch x86_64 "$bundle/Contents/Resources/mipo-core"
           export MIPO_SMOKE_EXECUTABLE="$bundle/Contents/MacOS/mipo"
           export MIPO_SMOKE_SLOW=1
-          node "$candidate/runtime/desktop-harness/packaged-smoke.mjs" 2>&1 | tee "$candidate/smoke.log"
+          node "$candidate/runtime/desktop-harness/apps/desktop/tests/packaged-smoke.mjs" 2>&1 | tee "$candidate/smoke.log"
           [[ "$(grep -c 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED' "$candidate/smoke.log")" = 2 ]]
           echo "MIPO_INTEL_PACKAGED_SMOKE_PASSED $EXPECTED_SHA256 $HARNESS_SHA256"
