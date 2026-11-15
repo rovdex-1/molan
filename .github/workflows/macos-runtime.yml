@@ -60,8 +60,8 @@ jobs:
           unset GH_TOKEN GITHUB_TOKEN
           bundle="$candidate/runtime/MIPO.app"
           codesign --verify --deep --strict "$bundle"
-          lipo -verify_arch x86_64 "$bundle/Contents/MacOS/mipo"
-          lipo -verify_arch x86_64 "$bundle/Contents/Resources/mipo-core"
+          lipo "$bundle/Contents/MacOS/mipo" -verify_arch x86_64
+          lipo "$bundle/Contents/Resources/mipo-core" -verify_arch x86_64
           export MIPO_SMOKE_EXECUTABLE="$bundle/Contents/MacOS/mipo"
           export MIPO_SMOKE_SLOW=1
           node "$candidate/runtime/desktop-harness/apps/desktop/tests/packaged-smoke.mjs" 2>&1 | tee "$candidate/smoke.log"
