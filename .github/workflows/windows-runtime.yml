@@ -1,4 +1,5 @@
 name: Validate Windows runtime
+run-name: Windows ${{ inputs.kind || 'player' }} ${{ inputs.asset_name || 'runner' }}
 on:
   workflow_dispatch:
     inputs:
