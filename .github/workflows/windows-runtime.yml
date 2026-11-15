@@ -37,13 +37,21 @@ on:
         description: Expected desktop installer SHA-256
         required: false
         type: string
+      player_harness_asset:
+        description: Compiled nested-player harness (desktop only)
+        required: false
+        type: string
+      player_harness_sha256:
+        description: Expected nested-player harness SHA-256
+        required: false
+        type: string
 permissions:
   # GitHub exposes draft assets only to tokens with repository push permission.
   contents: write
 jobs:
   validate:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - name: Check Windows runner
         shell: pwsh
@@ -126,13 +134,16 @@ jobs:
           HARNESS_SHA256: ${{ inputs.harness_sha256 }}
           INSTALLER_ASSET: ${{ inputs.installer_asset }}
           INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+          PLAYER_HARNESS_ASSET: ${{ inputs.player_harness_asset }}
+          PLAYER_HARNESS_SHA256: ${{ inputs.player_harness_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9._-]+$') { throw 'INVALID_RELEASE_TAG' }
           if ($env:ASSET_NAME -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
           if ($env:HARNESS_ASSET -notmatch '^MIPO-Desktop-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_HARNESS_NAME' }
           if ($env:INSTALLER_ASSET -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64-Setup.exe$') { throw 'INVALID_INSTALLER_NAME' }
-          foreach ($hash in @($env:EXPECTED_SHA256, $env:HARNESS_SHA256, $env:INSTALLER_SHA256)) {
+          if ($env:PLAYER_HARNESS_ASSET -notmatch '^MIPO-Player-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_PLAYER_HARNESS_NAME' }
+          foreach ($hash in @($env:EXPECTED_SHA256, $env:HARNESS_SHA256, $env:INSTALLER_SHA256, $env:PLAYER_HARNESS_SHA256)) {
             if ($hash -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
           }
           function Assert-X64Executable([string] $file) {
@@ -153,7 +164,7 @@ jobs:
           $candidate = Join-Path $env:RUNNER_TEMP 'mipo-desktop'
           $expanded = Join-Path $candidate 'runtime'
           New-Item -ItemType Directory -Path $expanded | Out-Null
-          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256},@{name=$env:INSTALLER_ASSET;hash=$env:INSTALLER_SHA256})) {
+          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256},@{name=$env:INSTALLER_ASSET;hash=$env:INSTALLER_SHA256},@{name=$env:PLAYER_HARNESS_ASSET;hash=$env:PLAYER_HARNESS_SHA256})) {
             gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $entry.name --dir $candidate
             if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
             $archive = Join-Path $candidate $entry.name
@@ -164,7 +175,21 @@ jobs:
           $env:GITHUB_TOKEN = $null
           $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo.exe')
           $harnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'packaged-smoke.mjs')
-          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1) { throw 'DESKTOP_ENTRY_COUNT' }
+          $playerHarnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'managed-player-smoke.mjs')
+          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1 -or $playerHarnesses.Count -ne 1) { throw 'DESKTOP_ENTRY_COUNT' }
+          function Test-PackagedPlayer([string] $root, [string] $label) {
+            $env:MIPO_PLAYER_EXECUTABLE = Join-Path $root 'resources/mipo-player/mipo-player.exe'
+            Assert-X64Executable $env:MIPO_PLAYER_EXECUTABLE
+            $env:MIPO_PLAYER_SMOKE_REPORT = Join-Path $candidate ($label + '-player.json')
+            & node $playerHarnesses[0].FullName
+            if ($LASTEXITCODE -ne 0) { throw "PACKAGED_PLAYER_SMOKE_FAILED $label" }
+            $reports = Get-Content -LiteralPath $env:MIPO_PLAYER_SMOKE_REPORT -Raw | ConvertFrom-Json
+            if ($reports.Count -ne 4 -or $reports[3].private -ne $true) { throw 'PACKAGED_PLAYER_FIXTURE_COUNT' }
+            foreach ($report in $reports) {
+              if ($report.supported -ne $true -or $report.isolated -ne $true) { throw 'PACKAGED_PLAYER_EME_FAILED' }
+              if ($report.electron -ne '45.2.1' -or $report.chromium -ne '156.0.8078.75') { throw 'PACKAGED_PLAYER_VERSION_MISMATCH' }
+            }
+          }
           $portableRoot = $executables[0].Directory.FullName
           Assert-X64Executable $executables[0].FullName
           Assert-X64Executable (Join-Path $portableRoot 'resources/mipo-core.exe')
@@ -174,6 +199,7 @@ jobs:
           & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw 'PORTABLE_DESKTOP_SMOKE_FAILED' }
           if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'PORTABLE_CLIPBOARD_SMOKE_MISSING' }
+          Test-PackagedPlayer $portableRoot 'portable'
           $installed = Join-Path $candidate 'mipo-installed'
           $setup = Start-Process -FilePath (Join-Path $candidate $env:INSTALLER_ASSET) -ArgumentList "/S /D=$installed" -PassThru
           try {
@@ -196,7 +222,8 @@ jobs:
           & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw 'INSTALLED_DESKTOP_SMOKE_FAILED' }
           if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'INSTALLED_CLIPBOARD_SMOKE_MISSING' }
-          Write-Output ('MIPO_WINDOWS_PACKAGED_SMOKE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $env:INSTALLER_SHA256 + ' ' + $env:HARNESS_SHA256)
+          Test-PackagedPlayer $installed 'installed'
+          Write-Output ('MIPO_WINDOWS_PACKAGED_SMOKE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $env:INSTALLER_SHA256 + ' ' + $env:HARNESS_SHA256 + ' ' + $env:PLAYER_HARNESS_SHA256)
       - name: Verify native visited-link pixels
         if: inputs.release_tag != '' && inputs.kind == 'native'
         shell: pwsh
