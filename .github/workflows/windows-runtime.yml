@@ -79,7 +79,14 @@ jobs:
               if ($fixture.private) {
                 $deadline = [DateTime]::UtcNow.AddSeconds(15)
                 while ((Test-Path -LiteralPath $report.temporaryDataDirectory) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 200 }
-                if (Test-Path -LiteralPath $report.temporaryDataDirectory) { throw 'PLAYER_PRIVATE_DATA_NOT_REMOVED' }
+                if (Test-Path -LiteralPath $report.temporaryDataDirectory) {
+                  Get-ChildItem -LiteralPath $report.temporaryDataDirectory | Select-Object Name,Mode
+                  Get-CimInstance Win32_Process | Where-Object ParentProcessId -eq $report.pid | Select-Object ProcessId,ParentProcessId,Name
+                  try { Remove-Item -LiteralPath $report.temporaryDataDirectory -Recurse -Force -ErrorAction Stop; Write-Output 'DIAGNOSTIC_MANUAL_REMOVAL_SUCCEEDED' } catch { Write-Output ('DIAGNOSTIC_REMOVAL_FAILED: ' + $_.Exception.Message) }
+                  $trace = $env:MIPO_PLAYER_REPORT + '.trace'
+                  if (Test-Path -LiteralPath $trace) { Get-Content -LiteralPath $trace }
+                  throw 'PLAYER_PRIVATE_DATA_NOT_REMOVED'
+                }
               }
               $report.PSObject.Properties.Remove('temporaryDataDirectory')
               $report.PSObject.Properties.Remove('pid')
