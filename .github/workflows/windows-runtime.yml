@@ -83,6 +83,19 @@ jobs:
                 if (Test-Path -LiteralPath $report.temporaryDataDirectory) {
                   Write-Host ('PRIVATE_FILES: ' + ((Get-ChildItem -LiteralPath $report.temporaryDataDirectory | Select-Object Name,Mode) | ConvertTo-Json -Compress))
                   Write-Host ('CHILD_PROCESSES: ' + ((Get-CimInstance Win32_Process | Where-Object ParentProcessId -eq $report.pid | Select-Object ProcessId,ParentProcessId,Name) | ConvertTo-Json -Compress))
+                  Write-Host ('PLAYER_PID: launched=' + $process.Id + ' reported=' + $report.pid)
+                  Write-Host ('REPORTED_PROCESS: ' + ((Get-Process -Id $report.pid -ErrorAction SilentlyContinue | Select-Object Id,ProcessName) | ConvertTo-Json -Compress))
+                  $encodedPath = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($report.temporaryDataDirectory))
+                  $cleanupScript = '$ErrorActionPreference=''Stop''; Wait-Process -Id {0} -ErrorAction SilentlyContinue; if(Get-Process -Id {0} -ErrorAction SilentlyContinue){{exit 2}}; $privateDirectory=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''{1}'')); Remove-Item -LiteralPath $privateDirectory -Recurse -Force -ErrorAction SilentlyContinue' -f $report.pid,$encodedPath
+                  $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cleanupScript))
+                  $stdout = Join-Path $candidate 'cleanup-direct.stdout'
+                  $stderr = Join-Path $candidate 'cleanup-direct.stderr'
+                  $direct = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand',$encodedCommand) -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+                  if (-not $direct.WaitForExit(10000)) { Stop-Process -Id $direct.Id -Force; Write-Host 'DIRECT_CLEANUP_TIMEOUT' }
+                  Write-Host ('DIRECT_CLEANUP_EXIT: ' + $direct.ExitCode)
+                  Write-Host ('DIRECT_CLEANUP_STDOUT: ' + (Get-Content -LiteralPath $stdout -Raw))
+                  Write-Host ('DIRECT_CLEANUP_STDERR: ' + (Get-Content -LiteralPath $stderr -Raw))
+                  Write-Host ('DIRECT_CLEANUP_REMOVED: ' + (-not (Test-Path -LiteralPath $report.temporaryDataDirectory)))
                   try { Remove-Item -LiteralPath $report.temporaryDataDirectory -Recurse -Force -ErrorAction Stop; Write-Host 'DIAGNOSTIC_MANUAL_REMOVAL_SUCCEEDED' } catch { Write-Host ('DIAGNOSTIC_REMOVAL_FAILED: ' + $_.Exception.Message) }
                   $trace = $env:MIPO_PLAYER_REPORT + '.trace'
                   if (Test-Path -LiteralPath $trace) { Write-Host (Get-Content -LiteralPath $trace -Raw) }
