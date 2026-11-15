@@ -7,7 +7,7 @@ on:
         description: Runtime acceptance target
         type: choice
         default: player
-        options: [player, native]
+        options: [player, native, desktop]
         required: false
       release_tag:
         description: Draft release containing candidates (empty checks runner availability)
@@ -29,13 +29,21 @@ on:
         description: Expected harness SHA-256
         required: false
         type: string
+      installer_asset:
+        description: Checksummed desktop NSIS installer (desktop only)
+        required: false
+        type: string
+      installer_sha256:
+        description: Expected desktop installer SHA-256
+        required: false
+        type: string
 permissions:
   # GitHub exposes draft assets only to tokens with repository push permission.
   contents: write
 jobs:
   validate:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Check Windows runner
         shell: pwsh
@@ -46,7 +54,7 @@ jobs:
           if (-not [Environment]::Is64BitOperatingSystem) { throw 'WINDOWS_X64_REQUIRED' }
           Write-Output 'WINDOWS_RUNNER_READY'
       - name: Verify packaged player with Main lifecycle
-        if: inputs.release_tag != '' && inputs.kind != 'native'
+        if: inputs.release_tag != '' && inputs.kind != 'native' && inputs.kind != 'desktop'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -106,6 +114,89 @@ jobs:
             if (-not $unmanaged.HasExited) { Stop-Process -Id $unmanaged.Id -Force }
           }
           Write-Output 'WINDOWS_MAIN_PLAYER_SMOKE_PASSED'
+      - name: Verify desktop ZIP and installed application
+        if: inputs.release_tag != '' && inputs.kind == 'desktop'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          EXPECTED_SHA256: ${{ inputs.sha256 }}
+          HARNESS_ASSET: ${{ inputs.harness_asset }}
+          HARNESS_SHA256: ${{ inputs.harness_sha256 }}
+          INSTALLER_ASSET: ${{ inputs.installer_asset }}
+          INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:RELEASE_TAG -notmatch '^[A-Za-z0-9._-]+$') { throw 'INVALID_RELEASE_TAG' }
+          if ($env:ASSET_NAME -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
+          if ($env:HARNESS_ASSET -notmatch '^MIPO-Desktop-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_HARNESS_NAME' }
+          if ($env:INSTALLER_ASSET -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64-Setup.exe$') { throw 'INVALID_INSTALLER_NAME' }
+          foreach ($hash in @($env:EXPECTED_SHA256, $env:HARNESS_SHA256, $env:INSTALLER_SHA256)) {
+            if ($hash -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
+          }
+          function Assert-X64Executable([string] $file) {
+            $stream = [IO.File]::OpenRead($file)
+            $reader = [IO.BinaryReader]::new($stream)
+            try {
+              if ($reader.ReadUInt16() -ne 0x5a4d) { throw 'PE_DOS_HEADER_MISSING' }
+              $stream.Position = 0x3c
+              $header = $reader.ReadUInt32()
+              if ($header -lt 0x40 -or $header -gt $stream.Length - 6) { throw 'INVALID_PE_OFFSET' }
+              $stream.Position = $header
+              if ($reader.ReadUInt32() -ne 0x4550 -or $reader.ReadUInt16() -ne 0x8664) { throw 'WINDOWS_X64_EXECUTABLE_REQUIRED' }
+            } finally {
+              $reader.Dispose()
+              $stream.Dispose()
+            }
+          }
+          $candidate = Join-Path $env:RUNNER_TEMP 'mipo-desktop'
+          $expanded = Join-Path $candidate 'runtime'
+          New-Item -ItemType Directory -Path $expanded | Out-Null
+          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256},@{name=$env:INSTALLER_ASSET;hash=$env:INSTALLER_SHA256})) {
+            gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $entry.name --dir $candidate
+            if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
+            $archive = Join-Path $candidate $entry.name
+            if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $entry.hash) { throw 'CANDIDATE_CHECKSUM_MISMATCH' }
+            if ($entry.name.EndsWith('.zip')) { Expand-Archive -LiteralPath $archive -DestinationPath $expanded }
+          }
+          $env:GH_TOKEN = $null
+          $env:GITHUB_TOKEN = $null
+          $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo.exe')
+          $harnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'packaged-smoke.mjs')
+          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1) { throw 'DESKTOP_ENTRY_COUNT' }
+          $portableRoot = $executables[0].Directory.FullName
+          Assert-X64Executable $executables[0].FullName
+          Assert-X64Executable (Join-Path $portableRoot 'resources/mipo-core.exe')
+          $env:MIPO_SMOKE_SLOW = '1'
+          $env:MIPO_SMOKE_EXECUTABLE = $executables[0].FullName
+          $log = Join-Path $candidate 'portable-smoke.log'
+          & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw 'PORTABLE_DESKTOP_SMOKE_FAILED' }
+          if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'PORTABLE_CLIPBOARD_SMOKE_MISSING' }
+          $installed = Join-Path $candidate 'mipo-installed'
+          $setup = Start-Process -FilePath (Join-Path $candidate $env:INSTALLER_ASSET) -ArgumentList "/S /D=$installed" -PassThru
+          try {
+            if (-not $setup.WaitForExit(120000)) { throw 'DESKTOP_INSTALL_TIMEOUT' }
+            if ($setup.ExitCode -ne 0) { throw 'DESKTOP_INSTALL_FAILED' }
+          } finally {
+            if (-not $setup.HasExited) { Stop-Process -Id $setup.Id -Force }
+          }
+          # Every portable payload file must survive the actual NSIS install.
+          foreach ($file in Get-ChildItem -LiteralPath $portableRoot -Recurse -File) {
+            $relative = [IO.Path]::GetRelativePath($portableRoot, $file.FullName)
+            $target = Join-Path $installed $relative
+            if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { throw "INSTALLED_FILE_MISSING $relative" }
+            if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash) { throw "INSTALLED_FILE_MISMATCH $relative" }
+          }
+          $env:MIPO_SMOKE_EXECUTABLE = Join-Path $installed 'mipo.exe'
+          Assert-X64Executable $env:MIPO_SMOKE_EXECUTABLE
+          Assert-X64Executable (Join-Path $installed 'resources/mipo-core.exe')
+          $log = Join-Path $candidate 'installed-smoke.log'
+          & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw 'INSTALLED_DESKTOP_SMOKE_FAILED' }
+          if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'INSTALLED_CLIPBOARD_SMOKE_MISSING' }
+          Write-Output ('MIPO_WINDOWS_PACKAGED_SMOKE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $env:INSTALLER_SHA256 + ' ' + $env:HARNESS_SHA256)
       - name: Verify native visited-link pixels
         if: inputs.release_tag != '' && inputs.kind == 'native'
         shell: pwsh
