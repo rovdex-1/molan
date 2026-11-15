@@ -142,8 +142,12 @@ jobs:
           if ($env:ASSET_NAME -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64.zip$') { throw 'INVALID_ASSET_NAME' }
           if ($env:HARNESS_ASSET -notmatch '^MIPO-Desktop-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_HARNESS_NAME' }
           if ($env:INSTALLER_ASSET -notmatch '^MIPO-Desktop-[A-Za-z0-9._-]+-windows-x64-Setup.exe$') { throw 'INVALID_INSTALLER_NAME' }
-          if ($env:PLAYER_HARNESS_ASSET -notmatch '^MIPO-Player-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_PLAYER_HARNESS_NAME' }
-          foreach ($hash in @($env:EXPECTED_SHA256, $env:HARNESS_SHA256, $env:INSTALLER_SHA256, $env:PLAYER_HARNESS_SHA256)) {
+          $withPlayer = -not [string]::IsNullOrEmpty($env:PLAYER_HARNESS_ASSET)
+          if ($withPlayer) {
+            if ($env:PLAYER_HARNESS_ASSET -notmatch '^MIPO-Player-Smoke-[a-f0-9]{12}.zip$') { throw 'INVALID_PLAYER_HARNESS_NAME' }
+            if ($env:PLAYER_HARNESS_SHA256 -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_PLAYER_HARNESS_CHECKSUM' }
+          } elseif (-not [string]::IsNullOrEmpty($env:PLAYER_HARNESS_SHA256)) { throw 'PLAYER_HARNESS_REQUIRED' }
+          foreach ($hash in @($env:EXPECTED_SHA256, $env:HARNESS_SHA256, $env:INSTALLER_SHA256)) {
             if ($hash -notmatch '^[0-9a-f]{64}$') { throw 'INVALID_CHECKSUM' }
           }
           function Assert-X64Executable([string] $file) {
@@ -164,7 +168,9 @@ jobs:
           $candidate = Join-Path $env:RUNNER_TEMP 'mipo-desktop'
           $expanded = Join-Path $candidate 'runtime'
           New-Item -ItemType Directory -Path $expanded | Out-Null
-          foreach ($entry in @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256},@{name=$env:INSTALLER_ASSET;hash=$env:INSTALLER_SHA256},@{name=$env:PLAYER_HARNESS_ASSET;hash=$env:PLAYER_HARNESS_SHA256})) {
+          $downloads = @(@{name=$env:ASSET_NAME;hash=$env:EXPECTED_SHA256},@{name=$env:HARNESS_ASSET;hash=$env:HARNESS_SHA256},@{name=$env:INSTALLER_ASSET;hash=$env:INSTALLER_SHA256})
+          if ($withPlayer) { $downloads += @{name=$env:PLAYER_HARNESS_ASSET;hash=$env:PLAYER_HARNESS_SHA256} }
+          foreach ($entry in $downloads) {
             gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern $entry.name --dir $candidate
             if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_DOWNLOAD_FAILED' }
             $archive = Join-Path $candidate $entry.name
@@ -176,7 +182,8 @@ jobs:
           $executables = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'mipo.exe')
           $harnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'packaged-smoke.mjs')
           $playerHarnesses = @(Get-ChildItem -LiteralPath $expanded -Recurse -Filter 'managed-player-smoke.mjs')
-          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1 -or $playerHarnesses.Count -ne 1) { throw 'DESKTOP_ENTRY_COUNT' }
+          if ($executables.Count -ne 1 -or $harnesses.Count -ne 1) { throw 'DESKTOP_ENTRY_COUNT' }
+          if ($withPlayer -and $playerHarnesses.Count -ne 1) { throw 'PLAYER_HARNESS_ENTRY_COUNT' }
           function Test-PackagedPlayer([string] $root, [string] $label) {
             $env:MIPO_PLAYER_EXECUTABLE = Join-Path $root 'resources/mipo-player/mipo-player.exe'
             Assert-X64Executable $env:MIPO_PLAYER_EXECUTABLE
@@ -191,6 +198,7 @@ jobs:
             }
           }
           $portableRoot = $executables[0].Directory.FullName
+          if (-not $withPlayer -and (Test-Path (Join-Path $portableRoot 'resources/mipo-player'))) { throw 'UNEXPECTED_PLAYER_BUNDLE' }
           Assert-X64Executable $executables[0].FullName
           Assert-X64Executable (Join-Path $portableRoot 'resources/mipo-core.exe')
           $env:MIPO_SMOKE_SLOW = '1'
@@ -199,7 +207,7 @@ jobs:
           & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw 'PORTABLE_DESKTOP_SMOKE_FAILED' }
           if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'PORTABLE_CLIPBOARD_SMOKE_MISSING' }
-          Test-PackagedPlayer $portableRoot 'portable'
+          if ($withPlayer) { Test-PackagedPlayer $portableRoot 'portable' }
           $installed = Join-Path $candidate 'mipo-installed'
           $setup = Start-Process -FilePath (Join-Path $candidate $env:INSTALLER_ASSET) -ArgumentList "/S /D=$installed" -PassThru
           try {
@@ -222,8 +230,10 @@ jobs:
           & node $harnesses[0].FullName 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { throw 'INSTALLED_DESKTOP_SMOKE_FAILED' }
           if (@(Select-String -LiteralPath $log -SimpleMatch 'BROWSER_SMOKE_IMAGE_COPY_STAGE_RESTORED').Count -ne 2) { throw 'INSTALLED_CLIPBOARD_SMOKE_MISSING' }
-          Test-PackagedPlayer $installed 'installed'
-          Write-Output ('MIPO_WINDOWS_PACKAGED_SMOKE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $env:INSTALLER_SHA256 + ' ' + $env:HARNESS_SHA256 + ' ' + $env:PLAYER_HARNESS_SHA256)
+          if ($withPlayer) { Test-PackagedPlayer $installed 'installed' }
+          $marker = 'MIPO_WINDOWS_PACKAGED_SMOKE_PASSED ' + $env:EXPECTED_SHA256 + ' ' + $env:INSTALLER_SHA256 + ' ' + $env:HARNESS_SHA256
+          if ($withPlayer) { $marker += ' ' + $env:PLAYER_HARNESS_SHA256 }
+          Write-Output $marker
       - name: Verify native visited-link pixels
         if: inputs.release_tag != '' && inputs.kind == 'native'
         shell: pwsh
